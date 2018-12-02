@@ -30,6 +30,21 @@
  */
 #define CONFIGURATION    1
 
+/* Describe the kernel gpio support type
+ * 0 = sysfs
+ * 1 = chardev
+ */
+
+#define GPIOCHARDEV      1
+
+#if (GPIOCHARDEV == 1)
+/* Describe the GPIO char dev name
+ * If system only support char dev, please adjust the PIN_INIT
+ * and PIN_ENABLE below to the number on the corresponding chip.
+ */
+#define GPIOCHARDEVNAME  "/dev/gpiochip0"
+#endif
+
 #if (CONFIGURATION == 1)
 /* OM557x on Raspberry Pi */
  #define I2C_BUS         "/dev/i2c-1"

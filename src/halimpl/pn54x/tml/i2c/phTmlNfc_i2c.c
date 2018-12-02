@@ -28,6 +28,8 @@
 #include <sys/select.h>
 #include <errno.h>
 
+#include <linux/gpio.h>
+
 #include <linux/i2c-dev.h>
 #include <linux/i2c.h>
 
@@ -58,6 +60,7 @@ static bool_t bFwDnldFlag = FALSE;
 static int iEnableFd    = 0;
 static int iInterruptFd = 0;
 static int iI2CFd       = 0;
+static int gFd          = 0;
 static int dummyHandle = 1234;
 
 // ------------------------------------------------------------------
@@ -69,13 +72,134 @@ static int dummyHandle = 1234;
 #define EDGE_FALLING 2
 #define EDGE_BOTH    3
 
+#if GPIOCHARDEV
+
+static int writegpiodev ( int fd, unsigned int line, unsigned int value ) {
+    struct gpiohandle_request req;
+    struct gpiohandle_data data;
+
+    if ( fd <= 0 ) {
+        // GPIO device not found
+        NXPLOG_TML_E( "CHARDEV: GPIO device %s\n not available", GPIOCHARDEVNAME);
+    } else {
+        req.lines = 1;
+        req.lineoffsets[0] = line;
+        req.flags = GPIOHANDLE_REQUEST_OUTPUT;
+	req.default_values[0] = value;
+        strcpy(req.consumer_label, "PIN");
+        int ret = ioctl(fd, GPIO_GET_LINEHANDLE_IOCTL, &req);
+        if ( ret <= 0 ) {
+            NXPLOG_TML_E( "CHARDEV: Could not issue GPIO_GET_LINEHANDLE_IOCTL to fd %d : %s", fd, strerror(errno) );
+        }
+        data.values[0] = value;
+        ret = ioctl(req.fd, GPIOHANDLE_SET_LINE_VALUES_IOCTL, &data);
+        if ( ret <= 0 ) {
+            NXPLOG_TML_E( "CHARDEV: Could not write date to line %d use GPIOHANDLE_SET_LINE_VALUES_IOCTL:%s", line, strerror(errno) );
+        } else {
+            return( req.fd ); //return the line handler
+        }
+    }
+    
+}
+
+static int readgpiodev ( int fd, unsigned int line ) {
+    struct gpiohandle_request req;
+    struct gpiohandle_data data;
+    req.lineoffsets[0] = line;
+    req.lines = 1;
+    req.flags = GPIOHANDLE_REQUEST_INPUT;
+    int lhfd = ioctl(fd, GPIO_GET_LINEHANDLE_IOCTL, &req);
+    if ( req.fd <= 0 ) {
+        NXPLOG_TML_E( "Could not trigger GPIO_GET_LINEHANDLE_IOCTL on fd'%d' (%s)", fd, strerror(errno) );
+    }
+    NXPLOG_TML_D( "readgpiodev:GPIO_GET_LINEHANDLE_IOCTL line %d",line );
+    int ret = ioctl(req.fd, GPIOHANDLE_GET_LINE_VALUES_IOCTL, &data);
+    NXPLOG_TML_D( "readgpiodev:GPIOHANDLE_GET_LINE_VALUES_IOCTL, line %d",line );
+    if ( ret < 0 ) {
+        NXPLOG_TML_E( "Could not open value line '%d' (%s)", line, strerror(errno) );
+        return -1;
+    } else {
+        NXPLOG_TML_D( "Pin %d value %s\n", line, data.values[0]?"high":"low" );
+        return ret;
+    }
+}
+
+void wait4interruptchardev(unsigned int line, uint32_t eventflag) {
+    struct gpiohandle_request req;
+    struct gpiohandle_data data;
+
+    if (iInterruptFd < 0) {
+        NXPLOG_TML_E( "GPIO device not available" );
+    } else {
+
+        req.lineoffsets[0] = line;
+	req.lines = 1;
+        req.flags = GPIOHANDLE_REQUEST_INPUT | eventflag;
+
+        int ret = ioctl(iInterruptFd, GPIO_GET_LINEEVENT_IOCTL, &req);
+        if (ret == -1) {
+            NXPLOG_TML_E( "Failed to issue GET EVENT: IOCTL (%d)\n", ret );
+	}
+    }
+
+    /* Read initial states */
+    int ret = ioctl(req.fd, GPIOHANDLE_GET_LINE_VALUES_IOCTL, &data);
+    if (ret == -1) {
+        NXPLOG_TML_E( "Failed to issue GPIOHANDLE GET LINE, VALUES IOCTL (%d)\n", ret);
+    }
+
+    NXPLOG_TML_D( "Monitoring line %d on %s\n", line, GPIOCHARDEVNAME );
+    NXPLOG_TML_D( "Initial line value: %d\n", data.values[0] );
+
+    while(1) {
+        struct gpioevent_data event;
+
+        ret = read(req.fd, &event, sizeof(event));
+        if (ret == -1) {
+            if (errno == -EAGAIN) {
+                continue;
+            } else {
+                ret = -errno;
+                NXPLOG_TML_E( "Failed to read event (%d)\n", ret );
+                break;
+            }
+        }
+
+        if (ret != sizeof(event)) {
+            NXPLOG_TML_E( "Reading event failed\n");
+            break;
+        }
+        NXPLOG_TML_D( "GPIO EVENT %llu: ", event.timestamp );
+        if (event.id == eventflag) {
+            NXPLOG_TML_D( "rising edge" );
+            break;
+        } else {
+            NXPLOG_TML_D( "Not a rising edge, continue" );
+            continue;
+        }
+    }
+}
+
+
+#endif
 static int verifyPin( int pin, int isoutput, int edge ) {
     char buf[40];
     // Check if gpio pin has already been created
     int hasGpio = 0;
+#if GPIOCHARDEV
+    struct gpiochip_info cinfo;
+    sprintf( buf, GPIOCHARDEVNAME );
+    NXPLOG_TML_D( "GPIO device %s\n", GPIOCHARDEVNAME );
+#else
     sprintf( buf, "/sys/class/gpio/gpio%d", pin );
     NXPLOG_TML_D( "Pin %s\n", buf );
+#endif
     int fd = open( buf, O_RDONLY );
+#if GPIOCHARDEV
+    if ( fd < 0 ) {
+        // GPIO device not found
+        NXPLOG_TML_E( "CHARDEV: GPIO device %s\n not available: %s", buf, strerror(errno));
+#else
     if ( fd <= 0 ) {
         // Pin not exported yet
         NXPLOG_TML_D( "Create pin %s\n", buf );
@@ -86,6 +210,7 @@ static int verifyPin( int pin, int isoutput, int edge ) {
 		usleep(100*1000);
             }
         }
+#endif
     } else {
         NXPLOG_TML_E( "System already has pin %s\n", buf );
         hasGpio = 1;
@@ -93,6 +218,28 @@ static int verifyPin( int pin, int isoutput, int edge ) {
     close( fd );
 
     if ( hasGpio ) {
+#if GPIOCHARDEV
+        sprintf( buf, GPIOCHARDEVNAME );
+        gFd = open( buf, O_RDONLY );
+	if (gFd <= 0){
+            NXPLOG_TML_E( "Failed to open '%s' (%s)", buf, strerror(errno) );
+	} else {
+	    NXPLOG_TML_D( "gFd %d", gFd );
+	}
+        int lfd;
+        if ( isoutput ) {
+	    NXPLOG_TML_D( "GPIOCHARDEV hasGpio isoutput" );
+            lfd = writegpiodev( gFd, pin, 0 );
+	    NXPLOG_TML_D( "GPIOCHARDEV hasGpio writegpiodev" );
+            if ( lfd > 0 ) {
+                NXPLOG_TML_D( "Pin %d now off\n", pin );
+                return lfd;
+            }
+        }
+	NXPLOG_TML_D( "GPIOCHARDEV not isoutput" );
+        lfd = readgpiodev( gFd, pin );
+        return gFd;
+#else
         // Make sure it is an output
         sprintf( buf, "/sys/class/gpio/gpio%d/direction", pin );
         NXPLOG_TML_D( "Direction %s\n", buf );
@@ -157,16 +304,26 @@ static int verifyPin( int pin, int isoutput, int edge ) {
                 }
             }
         }
+#endif
     }
     return( 0 );
 }
 
 static void pnOn( void ) {
+#if GPIOCHARDEV
+    if ( iEnableFd ) writegpiodev( iEnableFd, PIN_ENABLE, 1 );
+#else
     if ( iEnableFd ) write( iEnableFd, "1", 1 );
+#endif
 }
 
 static void pnOff( void ) {
+#if GPIOCHARDEV
+    if ( iEnableFd ) writegpiodev( iEnableFd, PIN_ENABLE, 0 );
+#else
     if ( iEnableFd ) write( iEnableFd, "0", 1 );
+#endif
+
 }
 
 static int pnGetint( void ) {
@@ -254,7 +411,9 @@ NFCSTATUS phTmlNfc_i2c_open_and_configure(pphTmlNfc_Config_t pConfig, void ** pL
     NXPLOG_TML_D("phTmlNfc_i2c_open_and_configure Alternative NFC\n");
     NXPLOG_TML_D( "NFC - Assign IO pins\n");
     // Assign IO pins
+    NXPLOG_TML_D( "verifyPin PIN_INT\n\n");
     iInterruptFd = verifyPin( PIN_INT,    0, EDGE_RISING );
+    NXPLOG_TML_D( "verifyPin PIN_ENABLE\n\n");
     iEnableFd    = verifyPin( PIN_ENABLE, 1, EDGE_NONE   );
     NXPLOG_TML_D( "NFCHW - open I2C bus - %s\n", I2C_BUS);
 
@@ -378,7 +537,11 @@ int phTmlNfc_i2c_read(void *pDevHandle, uint8_t * pBuffer, int nNbBytesToRead)
     else
     {
 #ifdef PHFL_TML_ALT_NFC
+    #if GPIOCHARDEV
+        wait4interruptchardev(PIN_INT, GPIOEVENT_EVENT_RISING_EDGE);
+    #else
         wait4interrupt();
+    #endif
 #endif
         ret_Read = read((intptr_t)pDevHandle, pBuffer, totalBtyesToRead - numRead);
         if (ret_Read > 0)
@@ -408,7 +571,11 @@ int phTmlNfc_i2c_read(void *pDevHandle, uint8_t * pBuffer, int nNbBytesToRead)
         if(numRead < totalBtyesToRead)
         {
 #ifdef PHFL_TML_ALT_NFC
-            wait4interrupt();
+    #if GPIOCHARDEV
+        wait4interruptchardev(PIN_INT, GPIOEVENT_EVENT_RISING_EDGE);
+    #else
+        wait4interrupt();
+    #endif
 #endif
             ret_Read = read((intptr_t)pDevHandle, pBuffer, totalBtyesToRead - numRead);
             if (ret_Read != totalBtyesToRead - numRead)
@@ -430,7 +597,11 @@ int phTmlNfc_i2c_read(void *pDevHandle, uint8_t * pBuffer, int nNbBytesToRead)
             totalBtyesToRead = pBuffer[NORMAL_MODE_LEN_OFFSET] + NORMAL_MODE_HEADER_LEN;
         }
 #ifdef PHFL_TML_ALT_NFC
+    #if GPIOCHARDEV
+        wait4interruptchardev(PIN_INT, GPIOEVENT_EVENT_RISING_EDGE);
+    #else
         wait4interrupt();
+    #endif
 #endif
         ret_Read = read((intptr_t)pDevHandle, (pBuffer + numRead), totalBtyesToRead - numRead);
         if (ret_Read > 0)
